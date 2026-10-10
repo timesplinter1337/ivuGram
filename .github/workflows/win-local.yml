@@ -79,23 +79,11 @@ jobs:
           >>"%GITHUB_ENV%" echo SRC=%SRC%
 
       # The prepare step is skipped entirely when nothing it depends on has changed.
+      # Python instead of PowerShell: the execution policy of the machine forbids .ps1 files.
       - name: Check libraries.
-        shell: powershell
         run: |
-          $prepare = Join-Path $env:SRC 'Telegram\build\prepare'
-          $files = @(Get-ChildItem $prepare -Recurse -File | Sort-Object FullName)
-          $files += Get-Item (Join-Path $env:SRC 'Telegram\build\qt_version.py')
-          $line = (Select-String -Path (Join-Path $env:SRC 'docs\building-win.md') -Pattern 'SDK version' | Select-Object -First 1).Line
-          if ($line -notmatch '\*\*([\d.]+)\*\*\s+SDK version') { throw 'SDK version not found in docs/building-win.md' }
-          $sdk = $Matches[1]
-          $text = (($files | ForEach-Object { (Get-FileHash $_.FullName).Hash }) -join '') + $sdk
-          $sha = New-Object Security.Cryptography.SHA256Managed
-          $stamp = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).Replace('-', '')
-          $stampFile = Join-Path $env:TBUILD '.ivugram-libs-stamp'
-          $old = if (Test-Path $stampFile) { (Get-Content $stampFile -Raw).Trim() } else { '' }
-          $changed = if ($old -eq $stamp) { 'false' } else { 'true' }
-          $now = [DateTime]::UtcNow.ToString('o')
-          [IO.File]::AppendAllText($env:GITHUB_ENV, "SDK=$sdk`nLIBS_STAMP=$stamp`nLIBS_CHANGED=$changed`nJOB_START=$now`n")
+          python -I "%SRC%\.github\scripts\win_local.py" stamp
+          if errorlevel 1 exit /b 1
 
       - name: Libraries.
         if: env.LIBS_CHANGED == 'true'
@@ -133,21 +121,9 @@ jobs:
 
       - name: Summary.
         if: always()
-        shell: powershell
         run: |
-          $exe = Join-Path $env:SRC 'out\Debug\Telegram.exe'
-          $lines = @('### Windows x64 Debug (local runner)', '')
-          $lines += '* Commit: `' + $env:GITHUB_SHA.Substring(0, 10) + '`'
-          if ($env:JOB_START) {
-            $span = [DateTime]::UtcNow - [DateTime]::Parse($env:JOB_START).ToUniversalTime()
-            $lines += '* Time since sources were synced: ' + [int]$span.TotalMinutes + ' min ' + $span.Seconds + ' s'
-          }
-          $lines += '* Libraries rebuilt: ' + $(if ($env:LIBS_CHANGED -eq 'true') { 'yes' } else { 'no' })
-          if (Test-Path $exe) {
-            $item = Get-Item $exe
-            $lines += '* Telegram.exe: ' + [int]($item.Length / 1MB) + ' MB, built ' + $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
-          }
-          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($lines -join "`n") + "`n")
+          if not defined SRC exit /b 0
+          python -I "%SRC%\.github\scripts\win_local.py" summary
 
       - name: Collect artifact.
         if: success() && inputs.upload
