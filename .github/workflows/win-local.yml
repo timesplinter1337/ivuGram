@@ -1,0 +1,166 @@
+name: Windows (local runner).
+
+# Runs on the self-hosted runner of this machine; push events only, never pull requests.
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'changelog.txt'
+      - 'LEGAL'
+      - 'LICENSE'
+      - '.github/**'
+      - '!.github/workflows/win-local.yml'
+      - 'lib/xdg/**'
+      - 'snap/**'
+      - 'Telegram/build/docker/**'
+      - 'Telegram/Resources/uwp/**'
+      - 'Telegram/SourceFiles/platform/linux/**'
+      - 'Telegram/SourceFiles/platform/mac/**'
+      - 'Telegram/Telegram/**'
+      - 'Telegram/configure.sh'
+      - 'Telegram/Telegram.plist'
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Upload Telegram.exe as an artifact.
+        type: boolean
+        default: false
+      reconfigure:
+        description: Delete the out directory and run CMake from scratch.
+        type: boolean
+        default: false
+
+# A newer push makes the older run pointless, the stages already built are kept.
+concurrency:
+  group: windows-local
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  windows:
+    name: Windows x64 Debug
+    runs-on: [self-hosted, Windows, X64, ivugram]
+    timeout-minutes: 600
+
+    env:
+      VSROOT: C:\Program Files\Microsoft Visual Studio\18\Community
+      # Windows 7 support needs the v143-based toolset, see docs/building-win.md.
+      VCVARS_VER: "14.44"
+      RECONFIGURE: ${{ inputs.reconfigure }}
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      # A persistent clone keeps out/ and the submodules, so every build is incremental.
+      - name: Sync sources.
+        run: |
+          set "TBUILD=%USERPROFILE%\TBuild"
+          set "SRC=%TBUILD%\ivuGram"
+          if not exist "%SRC%\.git" git clone --filter=blob:none --no-checkout "%GITHUB_SERVER_URL%/%GITHUB_REPOSITORY%.git" "%SRC%"
+          if errorlevel 1 exit /b 1
+          git -C "%SRC%" config core.longpaths true
+          git -C "%SRC%" fetch --no-tags --prune origin %GITHUB_SHA%
+          if errorlevel 1 exit /b 1
+          git -C "%SRC%" checkout --force --detach %GITHUB_SHA%
+          if errorlevel 1 exit /b 1
+          git -C "%SRC%" submodule sync --recursive
+          if errorlevel 1 exit /b 1
+          git -C "%SRC%" submodule update --init --recursive --depth 1 --jobs 8
+          if errorlevel 1 exit /b 1
+          >>"%GITHUB_ENV%" echo TBUILD=%TBUILD%
+          >>"%GITHUB_ENV%" echo SRC=%SRC%
+
+      # The prepare step is skipped entirely when nothing it depends on has changed.
+      - name: Check libraries.
+        shell: powershell
+        run: |
+          $prepare = Join-Path $env:SRC 'Telegram\build\prepare'
+          $files = @(Get-ChildItem $prepare -Recurse -File | Sort-Object FullName)
+          $files += Get-Item (Join-Path $env:SRC 'Telegram\build\qt_version.py')
+          $line = (Select-String -Path (Join-Path $env:SRC 'docs\building-win.md') -Pattern 'SDK version' | Select-Object -First 1).Line
+          if ($line -notmatch '\*\*([\d.]+)\*\*\s+SDK version') { throw 'SDK version not found in docs/building-win.md' }
+          $sdk = $Matches[1]
+          $text = (($files | ForEach-Object { (Get-FileHash $_.FullName).Hash }) -join '') + $sdk
+          $sha = New-Object Security.Cryptography.SHA256Managed
+          $stamp = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).Replace('-', '')
+          $stampFile = Join-Path $env:TBUILD '.ivugram-libs-stamp'
+          $old = if (Test-Path $stampFile) { (Get-Content $stampFile -Raw).Trim() } else { '' }
+          $changed = if ($old -eq $stamp) { 'false' } else { 'true' }
+          $now = [DateTime]::UtcNow.ToString('o')
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "SDK=$sdk`nLIBS_STAMP=$stamp`nLIBS_CHANGED=$changed`nJOB_START=$now`n")
+
+      - name: Libraries.
+        if: env.LIBS_CHANGED == 'true'
+        run: |
+          call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64 %SDK% -vcvars_ver=%VCVARS_VER%
+          if errorlevel 1 exit /b 1
+          call "%SRC%\Telegram\build\prepare\win.bat" silent
+          if errorlevel 1 exit /b 1
+          >"%TBUILD%\.ivugram-libs-stamp" echo %LIBS_STAMP%
+
+      # No debug info keeps the objects small and the linker fast, see CMAKE_MSVC_DEBUG_INFORMATION_FORMAT.
+      - name: Configure.
+        run: |
+          call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64 %SDK% -vcvars_ver=%VCVARS_VER%
+          if errorlevel 1 exit /b 1
+          if "%RECONFIGURE%"=="true" if exist "%SRC%\out" rmdir /s /q "%SRC%\out"
+          if exist "%SRC%\out\build.ninja" exit /b 0
+          cd /d "%SRC%\Telegram"
+          call configure.bat ^
+          -G "Ninja Multi-Config" ^
+          -D TDESKTOP_API_TEST=ON ^
+          -D CMAKE_CONFIGURATION_TYPES=Debug ^
+          -D CMAKE_COMPILE_WARNING_AS_ERROR=ON ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          if errorlevel 1 exit /b 1
+
+      - name: Build.
+        run: |
+          call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64 %SDK% -vcvars_ver=%VCVARS_VER%
+          if errorlevel 1 exit /b 1
+          cmake --build "%SRC%\out" --config Debug --parallel
+          if errorlevel 1 exit /b 1
+
+      - name: Summary.
+        if: always()
+        shell: powershell
+        run: |
+          $exe = Join-Path $env:SRC 'out\Debug\Telegram.exe'
+          $lines = @('### Windows x64 Debug (local runner)', '')
+          $lines += '* Commit: `' + $env:GITHUB_SHA.Substring(0, 10) + '`'
+          if ($env:JOB_START) {
+            $span = [DateTime]::UtcNow - [DateTime]::Parse($env:JOB_START).ToUniversalTime()
+            $lines += '* Time since sources were synced: ' + [int]$span.TotalMinutes + ' min ' + $span.Seconds + ' s'
+          }
+          $lines += '* Libraries rebuilt: ' + $(if ($env:LIBS_CHANGED -eq 'true') { 'yes' } else { 'no' })
+          if (Test-Path $exe) {
+            $item = Get-Item $exe
+            $lines += '* Telegram.exe: ' + [int]($item.Length / 1MB) + ' MB, built ' + $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+          }
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($lines -join "`n") + "`n")
+
+      - name: Collect artifact.
+        if: success() && inputs.upload
+        run: |
+          mkdir artifact
+          copy /y "%SRC%\out\Debug\Telegram.exe" artifact\
+          if errorlevel 1 exit /b 1
+
+      - uses: actions/upload-artifact@v7
+        name: Upload artifact.
+        if: success() && inputs.upload
+        with:
+          name: Telegram Debug ${{ github.sha }}
+          path: artifact\
+          retention-days: 3
+          compression-level: 1
