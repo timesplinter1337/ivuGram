@@ -85,11 +85,13 @@ jobs:
           python -I "%SRC%\.github\scripts\win_local.py" stamp
           if errorlevel 1 exit /b 1
 
+      # The msbuild shim maps the v143 projects of lzma and breakpad to v145 with the 14.44 compiler.
       - name: Libraries.
         if: env.LIBS_CHANGED == 'true'
         run: |
           call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64 %SDK% -vcvars_ver=%VCVARS_VER%
           if errorlevel 1 exit /b 1
+          set "PATH=%SRC%\.github\scripts\msbuild-v143;%PATH%"
           call "%SRC%\Telegram\build\prepare\win.bat" silent
           if errorlevel 1 exit /b 1
           >"%TBUILD%\.ivugram-libs-stamp" echo %LIBS_STAMP%
